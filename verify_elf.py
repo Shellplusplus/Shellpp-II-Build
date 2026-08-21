@@ -50,6 +50,9 @@ FIRMWARE_FUNCTIONS = {
     0x0C1D50B1,  # opendir
     0x0C1D50ED,  # closedir
     0x0C1D5119,  # readdir
+    0x0C13CC51,  # lv_display_get_layer_top
+    0x0C16D151,  # lv_timer_create
+    0x0C16D1C5,  # lv_timer_delete
     0x0C49EB81,  # lvx_style_apply
     0x0C4A7BED,  # lvx_list_row_update
     0x0C4A7F49,  # lvx_list_row_trailing
