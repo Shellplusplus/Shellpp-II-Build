@@ -50,6 +50,13 @@ FIRMWARE_FUNCTIONS = {
     0x0C1D50B1,  # opendir
     0x0C1D50ED,  # closedir
     0x0C1D5119,  # readdir
+    0x0C6568B1,  # posix_spawnattr_init
+    0x0C65690D,  # posix_spawnattr_destroy
+    0x0C8C86D9,  # posix_spawn_file_actions_addopen
+    0x0C8C874D,  # posix_spawn_file_actions_destroy
+    0x0C8C877D,  # posix_spawn_file_actions_init
+    0x0C8CD1C1,  # waitpid
+    0x0C8CD299,  # posix_spawn
     0x0C13CC51,  # lv_display_get_layer_top
     0x0C16D151,  # lv_timer_create
     0x0C16D1C5,  # lv_timer_delete
@@ -146,6 +153,7 @@ def verify_absolute_addresses(
     data: bytes,
     sections: list[Section],
     symbols: list[ElfSymbol],
+    relocation_offsets: set[tuple[int, int]],
 ) -> None:
     """Reject guessed firmware addresses embedded in allocated sections."""
     mapping_ranges: dict[int, list[tuple[int, int]]] = {}
@@ -183,6 +191,12 @@ def verify_absolute_addresses(
         for range_start, range_end in ranges:
             aligned_start = (range_start + 3) & ~3
             for relative in range(aligned_start, range_end - 3, 4):
+                # An R_ARM_ABS32 relocation to this module's writable storage
+                # may carry the loader's provisional RAM addend in a Thumb
+                # literal pool.  It is not a firmware address and will be
+                # resolved by modlib when the module is loaded.
+                if (section_index, relative) in relocation_offsets:
+                    continue
                 value = struct.unpack_from("<I", data, section.offset + relative)[0]
                 location = section.name + "+0x" + format(relative, "x")
                 if 0x2C000000 <= value < 0x2D000000:
@@ -195,7 +209,12 @@ def verify_absolute_addresses(
                     if value not in FIRMWARE_FUNCTIONS:
                         fail("firmware function is not in the target whitelist at "
                              + location + ": 0x" + format(value, "08x"))
-                if 0x20000000 <= value < 0x21000000 and value not in FIRMWARE_DATA:
+                # The module loader assigns its own RAM image in 0x202xxxxx.
+                # Such values may be Thumb callbacks into this module, so only
+                # reject external firmware RAM references outside that image.
+                if (0x20000000 <= value < 0x21000000 and
+                        not (0x20200000 <= value < 0x20300000) and
+                        value not in FIRMWARE_DATA):
                     fail("firmware data address is not in the target whitelist at "
                          + location + ": 0x" + format(value, "08x"))
 
@@ -328,8 +347,19 @@ def parse_elf(path: Path) -> tuple[bytes, dict[str, int], list[Section], list[El
     if found_prohibited:
         fail("constructor/destructor sections are prohibited: " + ", ".join(found_prohibited))
 
+    relocation_offsets: set[tuple[int, int]] = set()
+    for section_index, section in enumerate(sections):
+        if section.type != SHT_REL:
+            continue
+        if section.info == 0 or section.info >= len(sections):
+            fail("relocation section has no valid target: " + section.name)
+        target_section = sections[section.info]
+        for offset in range(section.offset, section.offset + section.size, section.entry_size):
+            relocation_offset, _ = RELOCATION.unpack_from(data, offset)
+            relocation_offsets.add((section.info, relocation_offset))
+
     loaded_size = section_footprint(sections)
-    verify_absolute_addresses(data, sections, symbols)
+    verify_absolute_addresses(data, sections, symbols, relocation_offsets)
     relocations: set[int] = set()
     for section in sections:
         if section.type == SHT_RELA:
