@@ -1,0 +1,537 @@
+--- a/native_fs.c
++++ b/native_fs.c
+@@ -43,9 +43,14 @@
+ static union {
+     struct shellpp_fs_entry candidates[SHELLPP_FS_DIR_PAGE_ENTRIES + 1u];
+     uint8_t bytes[512];
++    struct {
++        void *directory;
++        uint32_t path_length;
++    } walk[WALK_DEPTH_LIMIT + 1u];
+ } g_fs_scratch;
+ #define g_candidates (g_fs_scratch.candidates)
+ #define g_fs_bytes (g_fs_scratch.bytes)
++#define g_walk_frames (g_fs_scratch.walk)
+ static char g_work_path[SHELLPP_FS_PATH_CAP];
+
+ static const char g_cache_path[] = "/data/shellpp-ii/cache";
+@@ -288,33 +293,34 @@
+     void *directory;
+     uint8_t *raw;
+     uint32_t count = 0;
++    struct shellpp_fs_entry *entry;
+     if (shellpp_fs_validate_path(path) != SHELLPP_FS_OK || !page)
+         return SHELLPP_FS_ERR_ARGUMENT;
+     directory = VELA_OPENDIR(path);
+     if (!directory) return SHELLPP_FS_ERR_DIRECTORY;
+     clear_bytes(page, sizeof(*page));
+     clear_bytes(g_candidates, sizeof(g_candidates));
++    entry = &page->entries[0];
+     while ((raw = VELA_READDIR(directory)) != 0) {
+-        struct shellpp_fs_entry entry;
+         const char *name = (const char *)(raw + 1u);
+         uint32_t name_length = text_length(name, SHELLPP_FS_NAME_CAP);
+-        clear_bytes(&entry, sizeof(entry));
++        clear_bytes(entry, sizeof(*entry));
+         if (name_length == 0u || name_length >= SHELLPP_FS_NAME_CAP ||
+                 (name_length == 1u && name[0] == '.') ||
+                 (name_length == 2u && name[0] == '.' && name[1] == '.'))
+             continue;
+-        (void)copy_text(entry.name, sizeof(entry.name), name);
+-        entry.type = raw[0];
+-        entry.is_dir = raw[0] == VELA_DT_DIR;
+-        entry.is_link = raw[0] == VELA_DT_LNK;
+-        if (!entry_after_cursor(&entry, after)) continue;
++        (void)copy_text(entry->name, sizeof(entry->name), name);
++        entry->type = raw[0];
++        entry->is_dir = raw[0] == VELA_DT_DIR;
++        entry->is_link = raw[0] == VELA_DT_LNK;
++        if (!entry_after_cursor(entry, after)) continue;
+         if (raw[0] == VELA_DT_REG &&
+                 shellpp_fs_join(path, name, g_work_path, sizeof(g_work_path)) ==
+                     SHELLPP_FS_OK &&
+-                shellpp_fs_file_size(g_work_path, &entry.size, 0) ==
++                shellpp_fs_file_size(g_work_path, &entry->size, 0) ==
+                     SHELLPP_FS_OK)
+-            entry.size_known = 1u;
+-        (void)insert_candidate(&entry, &count);
++            entry->size_known = 1u;
++        (void)insert_candidate(entry, &count);
+     }
+     if (VELA_CLOSEDIR(directory) < 0) return SHELLPP_FS_ERR_CLOSE;
+     page->count = count > SHELLPP_FS_DIR_PAGE_ENTRIES ?
+@@ -468,7 +474,8 @@
+ }
+
+ int shellpp_fs_read_cpu(char *text, uint32_t capacity, uint32_t *percent) {
+-    uint8_t raw[96];
++    uint8_t *raw = g_fs_bytes;
++    const uint32_t raw_capacity = 96u;
+     uint8_t probe;
+     uint32_t values[2];
+     uint32_t value_count = 0u;
+@@ -486,8 +493,8 @@
+         cpu_set_text(text, capacity, "ERR:open");
+         return SHELLPP_FS_ERR_OPEN;
+     }
+-    while (length < sizeof(raw) - 1u) {
+-        remaining = sizeof(raw) - 1u - length;
++    while (length < raw_capacity - 1u) {
++        remaining = raw_capacity - 1u - length;
+         read_count = VELA_READ(fd, raw + length, remaining);
+         if (read_count < 0 || (uint32_t)read_count > remaining) {
+             (void)VELA_CLOSE(fd);
+@@ -497,7 +504,7 @@
+         if (read_count == 0) break;
+         length += (uint32_t)read_count;
+     }
+-    if (length == sizeof(raw) - 1u) {
++    if (length == raw_capacity - 1u) {
+         read_count = VELA_READ(fd, &probe, 1u);
+         if (read_count < 0 || read_count > 1) {
+             (void)VELA_CLOSE(fd);
+@@ -742,7 +749,7 @@
+  * first three numbers and the Umem match state. */
+ static int memory_read_live_umem(uint32_t *total, uint32_t *used,
+         uint32_t *free_bytes) {
+-    uint8_t chunk[96];
++    uint8_t *chunk = g_fs_bytes;
+     uint32_t numbers[3];
+     uint32_t number_value = 0u;
+     uint32_t number_count = 0u;
+@@ -751,7 +758,7 @@
+     int32_t fd = VELA_OPEN(g_memory_path, VELA_O_RDONLY, 0u);
+     if (fd < 0) return -1;
+     for (;;) {
+-        int32_t count = VELA_READ(fd, chunk, sizeof(chunk));
++        int32_t count = VELA_READ(fd, chunk, 96u);
+         uint32_t index;
+         if (count < 0) { (void)VELA_CLOSE(fd); return -1; }
+         if (count == 0) break;
+@@ -1211,14 +1218,27 @@
+
+ static int measure_directory_walk(uint32_t path_length, uint32_t depth,
+         uint32_t *total) {
+-    void *directory;
+     uint8_t *raw;
+     int result = SHELLPP_FS_OK;
+     if (depth > WALK_DEPTH_LIMIT || !total)
+         return SHELLPP_FS_ERR_PATH;
+-    directory = VELA_OPENDIR(g_work_path);
+-    if (!directory) return SHELLPP_FS_ERR_DIRECTORY;
+-    while ((raw = VELA_READDIR(directory)) != 0) {
++    g_walk_frames[depth].directory = VELA_OPENDIR(g_work_path);
++    g_walk_frames[depth].path_length = path_length;
++    if (!g_walk_frames[depth].directory)
++        return SHELLPP_FS_ERR_DIRECTORY;
++    for (;;) {
++        raw = VELA_READDIR(g_walk_frames[depth].directory);
++        if (!raw) {
++            if (VELA_CLOSEDIR(g_walk_frames[depth].directory) < 0 &&
++                    result == SHELLPP_FS_OK)
++                result = SHELLPP_FS_ERR_CLOSE;
++            if (depth == 0u) break;
++            --depth;
++            g_work_path[g_walk_frames[depth].path_length] = '\0';
++            continue;
++        }
++        path_length = g_walk_frames[depth].path_length;
++        {
+         const char *name = (const char *)(raw + 1u);
+         uint32_t name_length = text_length(name, SHELLPP_FS_NAME_CAP);
+         uint32_t child_length;
+@@ -1239,9 +1259,19 @@
+                 name[index];
+         g_work_path[child_length] = '\0';
+         if (raw[0] == VELA_DT_DIR) {
+-            if (measure_directory_walk(child_length, depth + 1u, total) !=
+-                    SHELLPP_FS_OK)
++            if (depth >= WALK_DEPTH_LIMIT) {
+                 result = SHELLPP_FS_ERR_DIRECTORY;
++            } else {
++                void *child = VELA_OPENDIR(g_work_path);
++                if (!child) {
++                    result = SHELLPP_FS_ERR_DIRECTORY;
++                } else {
++                    ++depth;
++                    g_walk_frames[depth].directory = child;
++                    g_walk_frames[depth].path_length = child_length;
++                    continue;
++                }
++            }
+         } else if (raw[0] == VELA_DT_REG) {
+             if (shellpp_fs_file_size(g_work_path, &size, 0u) ==
+                     SHELLPP_FS_OK)
+@@ -1250,9 +1280,8 @@
+                 result = SHELLPP_FS_ERR_READ;
+         }
+         g_work_path[path_length] = '\0';
++        }
+     }
+-    if (VELA_CLOSEDIR(directory) < 0 && result == SHELLPP_FS_OK)
+-        result = SHELLPP_FS_ERR_CLOSE;
+     return result;
+ }
+
+@@ -1358,13 +1387,35 @@
+
+ static int walk_directory(uint32_t path_length, uint32_t depth, uint8_t clear,
+         struct shellpp_cache_root_report *report) {
+-    void *directory;
+     uint8_t *raw;
+     int result = SHELLPP_FS_OK;
+     if (depth > WALK_DEPTH_LIMIT) { ++report->failed; return SHELLPP_FS_ERR_PATH; }
+-    directory = VELA_OPENDIR(g_work_path);
+-    if (!directory) { ++report->failed; return SHELLPP_FS_ERR_DIRECTORY; }
+-    while ((raw = VELA_READDIR(directory)) != 0) {
++    g_walk_frames[depth].directory = VELA_OPENDIR(g_work_path);
++    g_walk_frames[depth].path_length = path_length;
++    if (!g_walk_frames[depth].directory) {
++        ++report->failed;
++        return SHELLPP_FS_ERR_DIRECTORY;
++    }
++    for (;;) {
++        raw = VELA_READDIR(g_walk_frames[depth].directory);
++        if (!raw) {
++            uint32_t finished_length = g_walk_frames[depth].path_length;
++            if (VELA_CLOSEDIR(g_walk_frames[depth].directory) < 0) {
++                ++report->failed;
++                result = SHELLPP_FS_ERR_CLOSE;
++            }
++            if (depth == 0u) break;
++            if (clear) {
++                g_work_path[finished_length] = '\0';
++                if (VELA_RMDIR(g_work_path) == 0) ++report->deleted;
++                else { ++report->failed; result = SHELLPP_FS_ERR_DELETE; }
++            }
++            --depth;
++            g_work_path[g_walk_frames[depth].path_length] = '\0';
++            continue;
++        }
++        path_length = g_walk_frames[depth].path_length;
++        {
+         const char *name = (const char *)(raw + 1u);
+         uint32_t name_length = text_length(name, SHELLPP_FS_NAME_CAP);
+         uint32_t child_length;
+@@ -1383,12 +1434,20 @@
+         if (shellpp_fs_path_equal(g_work_path, g_icon_path)) {
+             ++report->skipped;
+         } else if (raw[0] == VELA_DT_DIR) {
+-            int child_result = walk_directory(child_length, depth + 1u, clear, report);
+-            if (child_result != SHELLPP_FS_OK) result = child_result;
+-            g_work_path[child_length] = '\0';
+-            if (clear) {
+-                if (VELA_RMDIR(g_work_path) == 0) ++report->deleted;
+-                else { ++report->failed; result = SHELLPP_FS_ERR_DELETE; }
++            if (depth >= WALK_DEPTH_LIMIT) {
++                ++report->failed;
++                result = SHELLPP_FS_ERR_PATH;
++            } else {
++                void *child = VELA_OPENDIR(g_work_path);
++                if (!child) {
++                    ++report->failed;
++                    result = SHELLPP_FS_ERR_DIRECTORY;
++                } else {
++                    ++depth;
++                    g_walk_frames[depth].directory = child;
++                    g_walk_frames[depth].path_length = child_length;
++                    continue;
++                }
+             }
+         } else if (raw[0] == VELA_DT_REG) {
+             if (shellpp_fs_file_size(g_work_path, &size, 0) == SHELLPP_FS_OK)
+@@ -1403,8 +1462,8 @@
+             ++report->skipped;
+         }
+         g_work_path[path_length] = '\0';
++        }
+     }
+-    if (VELA_CLOSEDIR(directory) < 0) { ++report->failed; result = SHELLPP_FS_ERR_CLOSE; }
+     return result;
+ }
+
+@@ -1441,6 +1500,38 @@
+     return overall;
+ }
+
++/* Recount after a clear without replacing the clear operation's per-root
++ * deleted/failed/skipped counters.  One root report is sufficient because
++ * the remaining byte total is accumulated before the next root starts. */
++static int scan_cache_remaining(uint8_t include_logs, uint32_t *bytes) {
++    struct shellpp_cache_root_report root;
++    uint32_t root_count = include_logs ? 5u : 4u;
++    int overall = SHELLPP_FS_OK;
++    if (!bytes) return SHELLPP_FS_ERR_ARGUMENT;
++    *bytes = 0u;
++    for (uint32_t index = 0u; index < root_count; ++index) {
++        int check;
++        clear_bytes(&root, sizeof(root));
++        if (index == 0u) root.path = g_cache_path;
++        else if (index == 1u) root.path = g_tmp_path;
++        else if (index == 2u) root.path = g_system_log_path;
++        else if (index == 3u) root.path = g_offline_log_path;
++        else root.path = g_shellpp_logs_path;
++        check = root_type(root.path, &root.exists);
++        if (check != SHELLPP_FS_OK) {
++            if (root.exists) overall = check;
++            continue;
++        }
++        if (!root.exists) continue;
++        (void)copy_text(g_work_path, sizeof(g_work_path), root.path);
++        if (walk_directory(text_length(g_work_path, sizeof(g_work_path)), 0u,
++                0u, &root) != SHELLPP_FS_OK)
++            overall = SHELLPP_FS_ERR_DIRECTORY;
++        add_saturated(bytes, root.bytes);
++    }
++    return overall;
++}
++
+ int shellpp_fs_cache_status(uint8_t include_logs,
+         struct shellpp_cache_report *report) {
+     if (!report) return SHELLPP_FS_ERR_ARGUMENT;
+@@ -1449,14 +1540,16 @@
+
+ int shellpp_fs_cache_clear(uint8_t include_logs,
+         struct shellpp_cache_report *report) {
+-    struct shellpp_cache_report after;
++    uint32_t before_bytes;
++    uint32_t after_bytes;
+     int result;
+     if (!report) return SHELLPP_FS_ERR_ARGUMENT;
+     result = scan_cache(include_logs, 1u, report);
+-    if (scan_cache(include_logs, 0u, &after) != SHELLPP_FS_OK &&
++    before_bytes = report->before_bytes;
++    if (scan_cache_remaining(include_logs, &after_bytes) != SHELLPP_FS_OK &&
+             result == SHELLPP_FS_OK) result = SHELLPP_FS_ERR_DIRECTORY;
+-    report->after_bytes = after.before_bytes;
+-    report->freed_bytes = report->before_bytes >= report->after_bytes ?
+-        report->before_bytes - report->after_bytes : 0u;
++    report->after_bytes = after_bytes;
++    report->freed_bytes = before_bytes >= after_bytes ?
++        before_bytes - after_bytes : 0u;
+     return result;
+ }
+--- a/native_ui.c
++++ b/native_ui.c
+@@ -274,12 +274,39 @@
+ static char g_path_buffer[SHELLPP_FS_PATH_CAP];
+ static char g_status[128];
+ static char g_size_text[40];
+-static char g_entry_secondary[SHELLPP_FS_DIR_PAGE_ENTRIES][32];
++static char g_entry_secondary[SHELLPP_FS_DIR_PAGE_ENTRIES][32]
++    __attribute__((aligned(4)));
+ static char g_cache_secondary[SHELLPP_FS_CACHE_ROOTS][40];
+ static char g_clipboard_secondary[96];
+ static char g_cache_total_text[24];
+ static char g_cache_freed_text[24];
+ static char g_memory_text[48];
++
++/* These buffers are not used while the application registry is parsed.
++ * Reuse them as parser temporaries so nested JSON parsing does not stack
++ * several 80-128 byte arrays on the firmware UI thread. */
++#define g_app_parse_key ((char *)&g_entry_secondary[0][0])
++#define g_app_parse_package g_clipboard_secondary
++#define g_app_parse_name g_path_buffer
++#define g_app_parse_candidate g_status
++
++_Static_assert(sizeof(g_entry_secondary) >= APP_JSON_KEY_CAP,
++    "application key scratch is too small");
++_Static_assert(sizeof(g_clipboard_secondary) >= APP_PACKAGE_CAP,
++    "application package scratch is too small");
++_Static_assert(sizeof(g_path_buffer) >= APP_NAME_CAP,
++    "application name scratch is too small");
++_Static_assert(sizeof(g_status) >= APP_NAME_CAP,
++    "application candidate scratch is too small");
++_Static_assert(__builtin_offsetof(struct app_workspace, object) % 4u == 0u,
++    "application object scratch must be word aligned");
++_Static_assert(sizeof(g_app_object) >= sizeof(struct row_spec) * UI_MAX_ROWS,
++    "application object scratch is too small for row specifications");
++_Static_assert(sizeof(g_entry_secondary) >=
++        sizeof(struct row_spec) * UI_MAX_ROWS,
++    "secondary scratch is too small for row specifications");
++_Static_assert(sizeof(g_workspace) >= sizeof(struct row_spec) * UI_MAX_ROWS,
++    "file workspace is too small for row specifications");
+
+ static uint32_t g_workspace_length;
+ static uint32_t g_selected_size;
+@@ -1359,8 +1386,8 @@
+ static int app_parse_captured_item(const uint8_t *data, uint32_t length,
+         char *package_name, char *display_name, uint8_t *locked) {
+     struct app_json_reader json;
+-    char key[APP_JSON_KEY_CAP];
+-    char candidate[APP_NAME_CAP];
++    char *key = g_app_parse_key;
++    char *candidate = g_app_parse_candidate;
+     uint8_t first = 1u;
+     uint8_t priority = 0xffu;
+     uint8_t byte;
+@@ -1374,7 +1401,8 @@
+     if (app_json_expect(&json, '{') < 0) return SHELLPP_FS_ERR_ARGUMENT;
+     for (;;) {
+         uint8_t candidate_priority;
+-        result = app_json_object_next_key(&json, &first, key, sizeof(key));
++        result = app_json_object_next_key(&json, &first, key,
++            APP_JSON_KEY_CAP);
+         if (result < 0) return SHELLPP_FS_ERR_ARGUMENT;
+         if (!result) break;
+         if (app_text_equal(key, "package")) {
+@@ -1390,7 +1418,7 @@
+                 (app_text_equal(key, "appName") ? 1u :
+                 (app_text_equal(key, "label") ? 2u : 3u));
+             result = app_json_read_string_value(&json, candidate,
+-                sizeof(candidate));
++                APP_NAME_CAP);
+             if (result < 0) return SHELLPP_FS_ERR_ARGUMENT;
+             if (result == 0 && candidate[0] && candidate_priority < priority) {
+                 app_copy_display_name(display_name, candidate);
+@@ -1415,8 +1443,8 @@
+     int result;
+     if (app_json_expect(json, '[') < 0) return SHELLPP_FS_ERR_ARGUMENT;
+     for (;;) {
+-        char package_name[APP_PACKAGE_CAP];
+-        char display_name[APP_NAME_CAP];
++        char *package_name = g_app_parse_package;
++        char *display_name = g_app_parse_name;
+         uint8_t locked;
+         uint32_t object_length;
+         result = app_json_array_next(json, &first);
+@@ -1450,7 +1478,7 @@
+ static int app_load_registry_items(const char *path, uint8_t source_index,
+         uint8_t optional) {
+     struct app_json_reader json;
+-    char key[APP_JSON_KEY_CAP];
++    char *key = g_app_parse_key;
+     uint8_t first = 1u;
+     uint8_t found_items = 0u;
+     uint8_t exists;
+@@ -1465,7 +1493,7 @@
+         result = SHELLPP_FS_OK;
+         for (;;) {
+             int next = app_json_object_next_key(&json, &first, key,
+-                sizeof(key));
++                APP_JSON_KEY_CAP);
+             if (next < 0) { result = SHELLPP_FS_ERR_ARGUMENT; break; }
+             if (!next) break;
+             if (app_text_equal(key, "InstalledApps")) {
+@@ -1540,7 +1568,7 @@
+ static int app_write_moved_object(struct shellpp_fs_atomic_writer *writer,
+         const uint8_t *data, uint32_t length, uint8_t make_hidden) {
+     struct app_json_reader json;
+-    char key[APP_JSON_KEY_CAP];
++    char *key = g_app_parse_key;
+     uint8_t first = 1u;
+     uint8_t output_first = 1u;
+     uint8_t byte;
+@@ -1551,7 +1579,8 @@
+             app_writer_char(writer, '{') != SHELLPP_FS_OK)
+         return SHELLPP_FS_ERR_ARGUMENT;
+     for (;;) {
+-        int next = app_json_object_next_key(&json, &first, key, sizeof(key));
++        int next = app_json_object_next_key(&json, &first, key,
++            APP_JSON_KEY_CAP);
+         if (next < 0) return SHELLPP_FS_ERR_ARGUMENT;
+         if (!next) break;
+         if (app_text_equal(key, "hideFlag")) {
+@@ -1594,8 +1623,8 @@
+         if (next < 0) return SHELLPP_FS_ERR_ARGUMENT;
+         if (!next) return SHELLPP_FS_OK;
+         if (remove_selected) {
+-            char package_name[APP_PACKAGE_CAP];
+-            char display_name[APP_NAME_CAP];
++            char *package_name = g_app_parse_package;
++            char *display_name = g_app_parse_name;
+             uint8_t locked;
+             uint32_t object_length;
+             uint8_t remove = 0u;
+@@ -1631,7 +1660,7 @@
+         uint8_t source_index, uint8_t operation, uint8_t all,
+         uint8_t make_hidden, uint8_t *output_empty, uint16_t *changed) {
+     struct app_json_reader json;
+-    char key[APP_JSON_KEY_CAP];
++    char *key = g_app_parse_key;
+     uint8_t root_first = 1u;
+     uint8_t found_items = 0u;
+     uint8_t exists;
+@@ -1646,7 +1675,7 @@
+         result = SHELLPP_FS_OK;
+         for (;;) {
+             int next = app_json_object_next_key(&json, &root_first, key,
+-                sizeof(key));
++                APP_JSON_KEY_CAP);
+             if (next < 0) { result = SHELLPP_FS_ERR_ARGUMENT; break; }
+             if (!next) break;
+             if (app_text_equal(key, "InstalledApps")) {
+@@ -1657,8 +1686,8 @@
+                 }
+                 found_items = 1u;
+                 for (;;) {
+-                    char package_name[APP_PACKAGE_CAP];
+-                    char display_name[APP_NAME_CAP];
++                    char *package_name = g_app_parse_package;
++                    char *display_name = g_app_parse_name;
+                     uint8_t locked;
+                     uint32_t object_length;
+                     int array_next = app_json_array_next(&json, &array_first);
+@@ -1700,7 +1729,7 @@
+         uint8_t allow_missing, uint16_t *changed) {
+     struct app_json_reader json;
+     struct shellpp_fs_atomic_writer writer;
+-    char key[APP_JSON_KEY_CAP];
++    char *key = g_app_parse_key;
+     uint8_t input_first = 1u;
+     uint8_t output_first = 1u;
+     uint8_t found_items = 0u;
+@@ -1743,7 +1772,7 @@
+         result = SHELLPP_FS_OK;
+         for (;;) {
+             int next = app_json_object_next_key(&json, &input_first, key,
+-                sizeof(key));
++                APP_JSON_KEY_CAP);
+             if (next < 0) { result = SHELLPP_FS_ERR_ARGUMENT; break; }
+             if (!next) break;
+             if (found_items && app_text_equal(key, "InstalledApps")) {
+@@ -2291,8 +2320,6 @@
+         (g_monitor_state & MONITOR_STATE_MEMORY_FLOAT) ?
+             "悬浮：已开启" : "悬浮：已关闭",
+         ACTION_MEMORY_FLOAT, 0u, 1u);
+-    (void)shellpp_fs_read_memory(g_memory_text,
+-        sizeof(g_memory_text), 0);
+     add_spec(specs, &count, "当前占用", g_memory_text,
+         ACTION_MEMORY_REFRESH, 0u, 1u);
+     apply_specs(PAGE_CPU, specs, count, 0, 0, 0);
+@@ -2345,7 +2372,7 @@
+ }
+
+ static void render_app_list(void) {
+-    struct row_spec specs[UI_MAX_ROWS];
++    struct row_spec *specs = (struct row_spec *)(void *)g_app_object;
+     uint32_t count = 0u;
+     uint32_t index;
+     uint32_t start = (uint32_t)g_app.page * APP_PAGE_SIZE;
+@@ -2417,7 +2444,7 @@
+ }
+
+ static void render_browser_list(uint32_t page_index) {
+-    struct row_spec specs[UI_MAX_ROWS];
++    struct row_spec *specs = (struct row_spec *)(void *)g_workspace;
+     uint32_t count = 0u;
+     uint32_t index;
+     int parent_result = shellpp_fs_parent(g_current_path, g_path_buffer,
+@@ -2456,7 +2483,7 @@
+ }
+
+ static void render_browser_detail(uint32_t page_index) {
+-    struct row_spec specs[UI_MAX_ROWS];
++    struct row_spec *specs = (struct row_spec *)(void *)g_workspace;
+     const char *name = shellpp_fs_basename(g_selected_path);
+     uint32_t count = 0u;
+     uint8_t viewable = !g_selected_is_link && g_selected_size_known &&
+@@ -2574,7 +2601,7 @@
+ }
+
+ static void render_cache(void) {
+-    struct row_spec specs[UI_MAX_ROWS];
++    struct row_spec *specs = (struct row_spec *)(void *)g_entry_secondary;
+     uint32_t count = 0u;
+     uint32_t index;
+     format_cache_size(g_cache_total_text, sizeof(g_cache_total_text),

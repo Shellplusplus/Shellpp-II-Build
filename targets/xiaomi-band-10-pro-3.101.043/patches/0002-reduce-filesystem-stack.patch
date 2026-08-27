@@ -1,0 +1,102 @@
+--- a/native_fs.c
++++ b/native_fs.c
+@@ -36,7 +36,16 @@
+ #define VELA_READDIR ((vela_readdir_t)SHELLPP_ABI_READDIR_ADDR)
+ #define VELA_RMDIR ((vela_rmdir_t)SHELLPP_ABI_RMDIR_ADDR)
+
+-static struct shellpp_fs_entry g_candidates[SHELLPP_FS_DIR_PAGE_ENTRIES + 1u];
++/* Firmware 3.101.043 runs these UI handlers on a smaller effective stack.
++ * The filesystem operations are serialized by the LVGL event loop, so one
++ * target-local workspace can hold either directory candidates or a parser
++ * buffer without increasing the module's nearly-full BSS allocation. */
++static union {
++    struct shellpp_fs_entry candidates[SHELLPP_FS_DIR_PAGE_ENTRIES + 1u];
++    uint8_t bytes[512];
++} g_fs_scratch;
++#define g_candidates (g_fs_scratch.candidates)
++#define g_fs_bytes (g_fs_scratch.bytes)
+ static char g_work_path[SHELLPP_FS_PATH_CAP];
+
+ static const char g_cache_path[] = "/data/shellpp-ii/cache";
+@@ -277,14 +286,13 @@
+ int shellpp_fs_list_page(const char *path,
+         const struct shellpp_fs_cursor *after, struct shellpp_fs_page *page) {
+     void *directory;
+     uint8_t *raw;
+     uint32_t count = 0;
+-    struct shellpp_fs_page result;
+     if (shellpp_fs_validate_path(path) != SHELLPP_FS_OK || !page)
+         return SHELLPP_FS_ERR_ARGUMENT;
+     directory = VELA_OPENDIR(path);
+     if (!directory) return SHELLPP_FS_ERR_DIRECTORY;
+-    clear_bytes(&result, sizeof(result));
++    clear_bytes(page, sizeof(*page));
+     clear_bytes(g_candidates, sizeof(g_candidates));
+     while ((raw = VELA_READDIR(directory)) != 0) {
+         struct shellpp_fs_entry entry;
+@@ -307,15 +315,14 @@
+         (void)insert_candidate(&entry, &count);
+     }
+     if (VELA_CLOSEDIR(directory) < 0) return SHELLPP_FS_ERR_CLOSE;
+-    result.count = count > SHELLPP_FS_DIR_PAGE_ENTRIES ?
++    page->count = count > SHELLPP_FS_DIR_PAGE_ENTRIES ?
+         SHELLPP_FS_DIR_PAGE_ENTRIES : (uint8_t)count;
+-    result.has_next = count > SHELLPP_FS_DIR_PAGE_ENTRIES;
+-    for (uint32_t index = 0; index < result.count; ++index)
+-        result.entries[index] = g_candidates[index];
+-    if (result.count) {
+-        entry_to_cursor(&result.entries[0], &result.first);
+-        entry_to_cursor(&result.entries[result.count - 1u], &result.last);
++    page->has_next = count > SHELLPP_FS_DIR_PAGE_ENTRIES;
++    for (uint32_t index = 0; index < page->count; ++index)
++        page->entries[index] = g_candidates[index];
++    if (page->count) {
++        entry_to_cursor(&page->entries[0], &page->first);
++        entry_to_cursor(&page->entries[page->count - 1u], &page->last);
+     }
+-    *page = result;
+     return SHELLPP_FS_OK;
+ }
+@@ -800,7 +807,7 @@
+ }
+
+ int shellpp_fs_read_memory(char *text, uint32_t capacity, uint32_t *percent) {
+-    uint8_t raw[512];
++    uint8_t *raw = g_fs_bytes;
+     uint8_t probe;
+     uint8_t found_total;
+     uint8_t found_free;
+@@ -842,7 +849,7 @@
+         return SHELLPP_FS_ERR_OPEN;
+     }
+-    while (length < sizeof(raw) - 1u) {
+-        remaining = sizeof(raw) - 1u - length;
++    while (length < sizeof(g_fs_scratch.bytes) - 1u) {
++        remaining = sizeof(g_fs_scratch.bytes) - 1u - length;
+         read_count = VELA_READ(fd, raw + length, remaining);
+         if (read_count < 0 || (uint32_t)read_count > remaining) {
+             (void)VELA_CLOSE(fd);
+@@ -854,7 +861,7 @@
+         if (read_count == 0) break;
+         length += (uint32_t)read_count;
+     }
+-    if (length == sizeof(raw) - 1u) {
++    if (length == sizeof(g_fs_scratch.bytes) - 1u) {
+         read_count = VELA_READ(fd, &probe, 1u);
+         if (read_count != 0) {
+             (void)VELA_CLOSE(fd);
+@@ -1253,5 +1260,5 @@
+         "/data/app", "/data/quickapp/system", "/data/quickapp/files"
+     };
+-    char path[SHELLPP_FS_PATH_CAP];
++    char *path = (char *)g_fs_bytes;
+     uint32_t index;
+     int result = SHELLPP_FS_OK;
+@@ -1273,5 +1280,6 @@
+         if (!exists) continue;
+         if (type != VELA_DT_DIR) { result = SHELLPP_FS_ERR_UNSAFE_TYPE; continue; }
+-        if (shellpp_fs_join(roots[index], package_name, path, sizeof(path)) !=
++        if (shellpp_fs_join(roots[index], package_name, path,
++                sizeof(g_fs_scratch.bytes)) !=
+                 SHELLPP_FS_OK) return SHELLPP_FS_ERR_PATH;
+         current = shellpp_fs_path_type(path, &exists, &type);

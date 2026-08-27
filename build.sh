@@ -1,245 +1,313 @@
 #!/bin/sh
-# Build the standalone NuttX loader-first module for one exact firmware ABI.
-set -e
+# Build Shell++ II firmware profiles and deploy their compiler-managed bins.
+set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../shellpp-ii" && pwd)
+PROJECT_DIR=/Users/ikun_cxkpro/Projects/Shell++/Shellpp-ii
 SOURCE_DIR="$PROJECT_DIR/module"
-TARGET_ENV="$PROJECT_DIR/targets/xiaomi-band-10-pro-3.101.036.env"
-INSTALLER_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../shellpp-ii-installer" && pwd)
-INSTALLER_SOURCE_DIR="$INSTALLER_DIR/_Lua"
-INSTALLER_EDITOR_DIR="$INSTALLER_DIR/_Lua"
-# manifest.xml packages this directory, rather than the editor-facing _Lua
-# directory above. Keep the two trees byte-identical on every build.
+TARGET_DIR="$SCRIPT_DIR/targets"
+INSTALLER_DIR=/Users/ikun_cxkpro/Projects/Shell++/Shellpp-ii-installer
+INSTALLER_LUA_DIR="$INSTALLER_DIR/_Lua"
 INSTALLER_PACKAGED_DIR="$INSTALLER_DIR/resources/_lua/_Lua"
-INSTALLER_MANIFEST="$INSTALLER_DIR/resources/manifest.xml"
-FROZEN_LUA_SHA256=36c93680345db23c1cd3d6c934d9984de2d91891b2259a811aedc17ef5559f48
-FROZEN_SUPERVISOR_SHA256=fbd5860c92392621b261955c3d6f30321194a0c956e4bfdfba99a73f844e3d79
+REPACK_SCRIPT="$SCRIPT_DIR/repack_resource.py"
 
-. "$TARGET_ENV"
-
-CLANG_BIN="$CLANG"
-if [ -z "$CLANG_BIN" ]; then CLANG_BIN=/usr/bin/clang; fi
-
-LLD_BIN="$RUST_LLD"
-if [ -z "$LLD_BIN" ]; then
-    LLD_BIN=/Users/ikun_cxkpro/.rustup/toolchains/stable-x86_64-apple-darwin/lib/rustlib/x86_64-apple-darwin/bin/rust-lld
+CLANG_BIN=${CLANG:-/usr/bin/clang}
+RUST_TOOLCHAIN_DIR=/Users/ikun_cxkpro/.rustup/toolchains/stable-x86_64-apple-darwin
+if [ -n "${RUST_LLD:-}" ]; then
+    LLD_BIN=$RUST_LLD
+    LLD_LIBRARY_DIR=${RUST_LLD_LIBRARY_PATH:-}
+else
+    LLD_BIN=$RUST_TOOLCHAIN_DIR/lib/rustlib/x86_64-apple-darwin/bin/rust-lld
+    LLD_LIBRARY_DIR=$RUST_TOOLCHAIN_DIR/lib
 fi
+PYTHON_BIN=${PYTHON:-/usr/local/bin/python3}
+BUILD_TARGET=
 
-PYTHON_BIN="$PYTHON"
-if [ -z "$PYTHON_BIN" ]; then PYTHON_BIN=/usr/local/bin/python3; fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --target)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "--target requires a target id" >&2
+                exit 2
+            fi
+            BUILD_TARGET=$2
+            shift 2
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            echo "usage: $0 [--target TARGET_ID]" >&2
+            exit 2
+            ;;
+    esac
+done
 
-NODE_BIN=${NODE:-}
-if [ -z "$NODE_BIN" ]; then NODE_BIN=$(command -v node || true); fi
-
-if [ ! -x "$CLANG_BIN" ]; then
-    echo "clang not executable: $CLANG_BIN" >&2
-    exit 1
-fi
-if [ ! -x "$LLD_BIN" ]; then
-    echo "rust-lld not executable: $LLD_BIN" >&2
-    echo "Set RUST_LLD to an ARM-capable lld binary." >&2
-    exit 1
-fi
-if [ ! -x "$PYTHON_BIN" ]; then
-    echo "python not executable: $PYTHON_BIN" >&2
-    exit 1
-fi
-if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
-    echo "node is required to generate the launcher icon" >&2
-    exit 1
-fi
-
-verify_installer_payload() {
-    payload_dir=$1
-    payload_label=$2
-
-    [ -d "$payload_dir" ] || {
-        echo "installer $payload_label directory is missing: $payload_dir" >&2
-        exit 1
-    }
-
-    for payload_name in main.lua shellpp_ii.bin shellpp_ii_icon.bin; do
-        if [ ! -f "$payload_dir/$payload_name" ] || [ -L "$payload_dir/$payload_name" ]; then
-            echo "installer $payload_label payload must be a regular file: $payload_dir/$payload_name" >&2
-            exit 1
-        fi
-    done
-
-    payload_count=$(find "$payload_dir" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d '[:space:]')
-    if [ "$payload_count" != 3 ]; then
-        echo "installer $payload_label payload must contain only main.lua, shellpp_ii.bin, and shellpp_ii_icon.bin" >&2
-        find "$payload_dir" -mindepth 1 -maxdepth 1 -print >&2
-        exit 1
-    fi
-
-    unexpected_payload=$(find "$payload_dir" -mindepth 1 -maxdepth 1 \
-        ! -name main.lua ! -name shellpp_ii.bin ! -name shellpp_ii_icon.bin -print -quit)
-    if [ -n "$unexpected_payload" ]; then
-        echo "unexpected installer $payload_label payload: $unexpected_payload" >&2
+require_executable() {
+    if [ ! -x "$1" ]; then
+        echo "$2 is not executable: $1" >&2
         exit 1
     fi
 }
 
-verify_installer_manifest() {
-    [ -f "$INSTALLER_MANIFEST" ] || {
-        echo "installer manifest is missing: $INSTALLER_MANIFEST" >&2
-        exit 1
-    }
+require_executable "$CLANG_BIN" clang
+require_executable "$LLD_BIN" rust-lld
+require_executable "$PYTHON_BIN" python
+if [ -n "$LLD_LIBRARY_DIR" ] && [ ! -d "$LLD_LIBRARY_DIR" ]; then
+    echo "rust-lld library directory is missing: $LLD_LIBRARY_DIR" >&2
+    exit 1
+fi
 
-    manifest_file_count=$(grep -c '<File[[:space:]]' "$INSTALLER_MANIFEST" || true)
-    if [ "$manifest_file_count" != 3 ]; then
-        echo "installer manifest must declare exactly one Lua file and two bin files" >&2
+run_lld() {
+    if [ -n "$LLD_LIBRARY_DIR" ]; then
+        env DYLD_LIBRARY_PATH="$LLD_LIBRARY_DIR" "$LLD_BIN" "$@"
+    else
+        "$LLD_BIN" "$@"
+    fi
+}
+
+if [ ! -d "$SOURCE_DIR/src" ] || [ ! -d "$SOURCE_DIR/include" ]; then
+    echo "nativeApp source is missing: $SOURCE_DIR" >&2
+    exit 1
+fi
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "target profile directory is missing: $TARGET_DIR" >&2
+    exit 1
+fi
+for installer_lua_dir in "$INSTALLER_LUA_DIR" "$INSTALLER_PACKAGED_DIR"; do
+    if [ ! -d "$installer_lua_dir" ] \
+        || [ ! -f "$installer_lua_dir/main.lua" ] \
+        || [ ! -f "$installer_lua_dir/shellpp_ii_icon.bin" ]; then
+        echo "installer Lua directory is incomplete: $installer_lua_dir" >&2
         exit 1
     fi
-
-    for manifest_path in \
-        _lua/_Lua/main.lua \
-        _lua/_Lua/shellpp_ii.bin \
-        _lua/_Lua/shellpp_ii_icon.bin; do
-        expected_entry="<File fileName=\"$manifest_path\" name=\"$manifest_path\"/>"
-        entry_count=$(grep -F -c "$expected_entry" "$INSTALLER_MANIFEST" || true)
-        if [ "$entry_count" != 1 ]; then
-            echo "installer manifest must declare exactly once: $manifest_path" >&2
-            exit 1
-        fi
-    done
-}
-
-# The installer Lua owns the already-validated loader sequence.  Refuse to
-# build before touching any output when the editor and packaged copies differ;
-# a native UI build must never repair or overwrite either copy.
-[ -d "$INSTALLER_SOURCE_DIR" ] || {
-    echo "installer source directory is missing: $INSTALLER_SOURCE_DIR" >&2
-    exit 1
-}
-[ -d "$INSTALLER_PACKAGED_DIR" ] || {
-    echo "installer packaged resource directory is missing: $INSTALLER_PACKAGED_DIR" >&2
-    exit 1
-}
-verify_installer_payload "$INSTALLER_SOURCE_DIR" "source"
-verify_installer_payload "$INSTALLER_PACKAGED_DIR" "packaged"
-verify_installer_manifest
-if [ ! -f "$INSTALLER_SOURCE_DIR/main.lua" ]; then
-    echo "installer source main.lua is missing: $INSTALLER_SOURCE_DIR/main.lua" >&2
+done
+if [ ! -f "$REPACK_SCRIPT" ]; then
+    echo "resource repack script is missing: $REPACK_SCRIPT" >&2
     exit 1
 fi
-if [ ! -f "$INSTALLER_PACKAGED_DIR/main.lua" ]; then
-    echo "installer packaged main.lua is missing: $INSTALLER_PACKAGED_DIR/main.lua" >&2
-    exit 1
-fi
-if ! cmp -s "$INSTALLER_SOURCE_DIR/main.lua" "$INSTALLER_PACKAGED_DIR/main.lua"; then
-    echo "refusing to overwrite frozen Lua: installer copies differ" >&2
-    exit 1
-fi
+for shared_resource in main.lua shellpp_ii_icon.bin; do
+    if ! cmp -s \
+        "$INSTALLER_LUA_DIR/$shared_resource" \
+        "$INSTALLER_PACKAGED_DIR/$shared_resource"; then
+        echo "installer shared resource differs between editing and packaged directories: $shared_resource" >&2
+        exit 1
+    fi
+done
 
 sha256_of() {
     shasum -a 256 "$1" | awk '{print $1}'
 }
 
-if [ "$(sha256_of "$INSTALLER_SOURCE_DIR/main.lua")" != "$FROZEN_LUA_SHA256" ]; then
-    echo "refusing to build: frozen installer Lua was modified" >&2
-    exit 1
+if [ -n "$BUILD_TARGET" ]; then
+    case "$BUILD_TARGET" in
+        *[!A-Za-z0-9._-]*)
+            echo "invalid target id: $BUILD_TARGET" >&2
+            exit 2
+            ;;
+    esac
+    PROFILES="$TARGET_DIR/$BUILD_TARGET.env"
+    if [ ! -f "$PROFILES" ]; then
+        echo "target profile not found: $PROFILES" >&2
+        exit 2
+    fi
+    DEPLOY_STAGE="$SCRIPT_DIR/out/.installer-stage-$BUILD_TARGET"
+else
+    PROFILES="$TARGET_DIR"/*.env
+    DEPLOY_STAGE="$SCRIPT_DIR/out/.installer-stage"
 fi
-if [ "$(sha256_of "$SOURCE_DIR/src/supervisor.c")" != "$FROZEN_SUPERVISOR_SHA256" ]; then
-    echo "refusing to build: frozen Supervisor was modified" >&2
-    exit 1
-fi
 
-OUT_DIR="$SCRIPT_DIR/out/$TARGET_ID"
-MODULE_PATH="$OUT_DIR/shellpp_ii.bin"
-MODULE_OBJECT="$OUT_DIR/supervisor.o"
-NATIVE_APP_OBJECT="$OUT_DIR/native_app.o"
-NATIVE_FS_OBJECT="$OUT_DIR/native_fs.o"
-NATIVE_UI_OBJECT="$OUT_DIR/native_ui.o"
-PRELUDE_OBJECT="$OUT_DIR/module_prelude.o"
+profile_count=0
+for profile in $PROFILES; do
+    if [ ! -f "$profile" ]; then
+        echo "no target profiles found in $TARGET_DIR" >&2
+        exit 1
+    fi
+    profile_count=$((profile_count + 1))
+done
 
-mkdir -p "$OUT_DIR"
+rm -rf "$DEPLOY_STAGE"
+mkdir -p "$DEPLOY_STAGE"
 
-compile_source() {
-    "$CLANG_BIN" \
-        --target=arm-none-eabi \
-        -mcpu="$CPU" \
-        -mthumb \
-        -mfloat-abi="$FLOAT_ABI" \
-        -Oz \
-        -ffreestanding \
-        -fno-builtin \
-        -fno-common \
-        -fno-stack-protector \
-        -fno-unwind-tables \
-        -fno-asynchronous-unwind-tables \
-        -fno-exceptions \
-        -fomit-frame-pointer \
-        -mlong-calls \
-        -Wall \
-        -Wextra \
-        -Werror \
-        -I "$SOURCE_DIR/include" \
-        -c "$1" \
-        -o "$2"
+build_target() {
+    profile=$1
+    profile_name=$(basename "$profile" .env)
+    staged_abi="$DEPLOY_STAGE/.$profile_name.shellpp_target_abi.h"
+
+    # Validate the complete profile before letting the shell read its plain
+    # assignments. This rejects unknown keys and shell syntax first.
+    "$PYTHON_BIN" "$SCRIPT_DIR/generate_target_abi.py" "$profile" "$staged_abi"
+
+    unset TARGET_ID FIRMWARE_VERSION FIRMWARE_CODE FIRMWARE_IMAGE
+    unset FIRMWARE_IMAGE_SIZE FIRMWARE_IMAGE_SHA256 CPU FLOAT_ABI
+    unset MAX_LOADED_SIZE MAX_BSS_SIZE
+    # Profiles are maintained here and intentionally use plain KEY=VALUE
+    # assignments so the target configuration remains inspectable.
+    . "$profile"
+
+    OUT_DIR="$SCRIPT_DIR/out/$TARGET_ID"
+    GENERATED_DIR="$OUT_DIR/generated"
+    ABI_HEADER="$GENERATED_DIR/shellpp_target_abi.h"
+    MODULE_NAME="shellpp_ii-$FIRMWARE_VERSION.bin"
+    MODULE_PATH="$OUT_DIR/$MODULE_NAME"
+    TARGET_SOURCE_DIR="$SOURCE_DIR/src"
+    TARGET_PATCH_DIR="$TARGET_DIR/$TARGET_ID/patches"
+
+    mkdir -p "$GENERATED_DIR"
+    cp "$staged_abi" "$ABI_HEADER"
+    cmp -s "$staged_abi" "$ABI_HEADER"
+
+    if [ ! -f "$FIRMWARE_IMAGE" ]; then
+        echo "firmware image is missing for $TARGET_ID: $FIRMWARE_IMAGE" >&2
+        exit 1
+    fi
+    actual_size=$(wc -c < "$FIRMWARE_IMAGE" | tr -d '[:space:]')
+    if [ "$actual_size" != "$FIRMWARE_IMAGE_SIZE" ]; then
+        echo "firmware size mismatch for $TARGET_ID: expected $FIRMWARE_IMAGE_SIZE, got $actual_size" >&2
+        exit 1
+    fi
+    actual_sha256=$(sha256_of "$FIRMWARE_IMAGE")
+    if [ "$actual_sha256" != "$FIRMWARE_IMAGE_SHA256" ]; then
+        echo "firmware SHA-256 mismatch for $TARGET_ID" >&2
+        echo "expected: $FIRMWARE_IMAGE_SHA256" >&2
+        echo "actual:   $actual_sha256" >&2
+        exit 1
+    fi
+
+    mkdir -p "$OUT_DIR"
+    rm -f "$OUT_DIR"/*.o "$OUT_DIR"/shellpp-ii-icon.bmp
+    rm -f "$OUT_DIR"/shellpp_ii*.bin
+
+    if [ -d "$TARGET_PATCH_DIR" ]; then
+        TARGET_SOURCE_DIR="$OUT_DIR/target-src"
+        rm -rf "$TARGET_SOURCE_DIR"
+        mkdir -p "$TARGET_SOURCE_DIR"
+        cp "$SOURCE_DIR"/src/*.c "$SOURCE_DIR"/src/*.S "$TARGET_SOURCE_DIR/"
+
+        patch_count=0
+        for patch_file in "$TARGET_PATCH_DIR"/*.patch; do
+            if [ ! -f "$patch_file" ]; then
+                echo "target patch directory contains no patch files: $TARGET_PATCH_DIR" >&2
+                exit 1
+            fi
+            patch_count=$((patch_count + 1))
+            patch -s -d "$TARGET_SOURCE_DIR" -p1 < "$patch_file"
+        done
+        echo "Applied $patch_count source patch(es) for $TARGET_ID"
+    fi
+
+    compile_source() {
+        source_path=$1
+        object_path=$2
+        "$CLANG_BIN" \
+            --target=arm-none-eabi \
+            -mcpu="$CPU" \
+            -mthumb \
+            -mfloat-abi="$FLOAT_ABI" \
+            -Oz \
+            -ffreestanding \
+            -fno-builtin \
+            -fno-common \
+            -fno-stack-protector \
+            -fno-unwind-tables \
+            -fno-asynchronous-unwind-tables \
+            -fno-exceptions \
+            -fomit-frame-pointer \
+            -mlong-calls \
+            -Wall \
+            -Wextra \
+            -Werror \
+            -I "$GENERATED_DIR" \
+            -I "$SOURCE_DIR/include" \
+            -c "$source_path" \
+            -o "$object_path"
+    }
+
+    compile_source "$TARGET_SOURCE_DIR/supervisor.c" "$OUT_DIR/supervisor.o"
+    compile_source "$TARGET_SOURCE_DIR/native_app.c" "$OUT_DIR/native_app.o"
+    compile_source "$TARGET_SOURCE_DIR/native_fs.c" "$OUT_DIR/native_fs.o"
+    compile_source "$TARGET_SOURCE_DIR/native_ui.c" "$OUT_DIR/native_ui.o"
+    compile_source "$TARGET_SOURCE_DIR/module_prelude.S" "$OUT_DIR/module_prelude.o"
+
+    run_lld \
+        -flavor gnu \
+        -m armelf \
+        -r \
+        -T "$SCRIPT_DIR/shellpp_ii.ld" \
+        -u module_initialize \
+        -o "$MODULE_PATH" \
+        "$OUT_DIR/module_prelude.o" \
+        "$OUT_DIR/supervisor.o" \
+        "$OUT_DIR/native_app.o" \
+        "$OUT_DIR/native_fs.o" \
+        "$OUT_DIR/native_ui.o"
+
+    "$PYTHON_BIN" "$SCRIPT_DIR/verify_shellpp_elf.py" \
+        --abi-header "$ABI_HEADER" \
+        --max-loaded-size "$MAX_LOADED_SIZE" \
+        --max-bss-size "$MAX_BSS_SIZE" \
+        "$MODULE_PATH"
+
+    cp "$MODULE_PATH" "$DEPLOY_STAGE/$MODULE_NAME"
+    cmp -s "$MODULE_PATH" "$DEPLOY_STAGE/$MODULE_NAME"
+    echo "Built $MODULE_PATH"
 }
 
-compile_source "$SOURCE_DIR/src/supervisor.c" "$MODULE_OBJECT"
-compile_source "$SOURCE_DIR/src/native_app.c" "$NATIVE_APP_OBJECT"
-compile_source "$SOURCE_DIR/src/native_fs.c" "$NATIVE_FS_OBJECT"
-compile_source "$SOURCE_DIR/src/native_ui.c" "$NATIVE_UI_OBJECT"
-compile_source "$SOURCE_DIR/src/module_prelude.S" "$PRELUDE_OBJECT"
+for profile in $PROFILES; do
+    build_target "$profile"
+done
 
-"$LLD_BIN" \
-    -flavor gnu \
-    -m armelf \
-    -r \
-    -T "$SCRIPT_DIR/shellpp_ii.ld" \
-    -u module_initialize \
-    -o "$MODULE_PATH" \
-    "$PRELUDE_OBJECT" \
-    "$MODULE_OBJECT" \
-    "$NATIVE_APP_OBJECT" \
-    "$NATIVE_FS_OBJECT" \
-    "$NATIVE_UI_OBJECT"
-
-"$PYTHON_BIN" "$SCRIPT_DIR/verify_elf.py" \
-    --max-loaded-size "$MAX_LOADED_SIZE" \
-    --max-bss-size 24576 \
-    "$MODULE_PATH"
-
-ICON_SOURCE="$PROJECT_DIR/assets/shellpp-ii-icon.png"
-ICON_BMP="$OUT_DIR/shellpp-ii-icon.bmp"
-if [ ! -f "$ICON_SOURCE" ]; then
-    echo "Shell++ icon source is missing: $ICON_SOURCE" >&2
-    exit 1
-fi
-if ! command -v sips >/dev/null 2>&1; then
-    echo "sips is required to generate the launcher icon on macOS" >&2
-    exit 1
-fi
-sips -s format bmp "$ICON_SOURCE" --out "$ICON_BMP" >/dev/null
-"$NODE_BIN" "$SCRIPT_DIR/make_icon_bin.js" "$ICON_BMP" \
-    "$INSTALLER_SOURCE_DIR/shellpp_ii_icon.bin"
-if [ ! -f "$INSTALLER_SOURCE_DIR/shellpp_ii_icon.bin" ]; then
-    echo "installer icon is missing: $INSTALLER_SOURCE_DIR/shellpp_ii_icon.bin" >&2
+staged_count=$(find "$DEPLOY_STAGE" -mindepth 1 -maxdepth 1 -type f -name 'shellpp_ii-*.bin' | wc -l | tr -d '[:space:]')
+if [ "$staged_count" != "$profile_count" ]; then
+    echo "staged module count mismatch: expected $profile_count, got $staged_count" >&2
     exit 1
 fi
 
-# Lua remains frozen. Synchronize only generated native artifacts into the
-# tree selected by manifest.xml.
-cp "$INSTALLER_SOURCE_DIR/shellpp_ii_icon.bin" "$INSTALLER_PACKAGED_DIR/shellpp_ii_icon.bin"
-cp "$MODULE_PATH" "$INSTALLER_EDITOR_DIR/shellpp_ii.bin"
-cp "$MODULE_PATH" "$INSTALLER_PACKAGED_DIR/shellpp_ii.bin"
+# All selected targets passed. A full build replaces the complete managed bin
+# set; a single-target build replaces only that target and preserves all other
+# firmware bins byte-for-byte. Both installer resource trees are kept in sync,
+# then resource.bin and hashCode are rebuilt from the packaged tree.
+for installer_lua_dir in "$INSTALLER_LUA_DIR" "$INSTALLER_PACKAGED_DIR"; do
+    if [ -z "$BUILD_TARGET" ]; then
+        find "$installer_lua_dir" -mindepth 1 -maxdepth 1 -type f \
+            -name 'shellpp_ii-*.bin' -delete
+        rm -f "$installer_lua_dir/shellpp_ii.bin"
+    fi
+    for module in "$DEPLOY_STAGE"/shellpp_ii-*.bin; do
+        cp "$module" "$installer_lua_dir/$(basename "$module")"
+    done
+done
 
-cmp -s "$INSTALLER_SOURCE_DIR/main.lua" "$INSTALLER_PACKAGED_DIR/main.lua"
-cmp -s "$INSTALLER_SOURCE_DIR/shellpp_ii_icon.bin" "$INSTALLER_PACKAGED_DIR/shellpp_ii_icon.bin"
-cmp -s "$MODULE_PATH" "$INSTALLER_EDITOR_DIR/shellpp_ii.bin"
-cmp -s "$MODULE_PATH" "$INSTALLER_PACKAGED_DIR/shellpp_ii.bin"
-verify_installer_payload "$INSTALLER_SOURCE_DIR" "source"
-verify_installer_payload "$INSTALLER_PACKAGED_DIR" "packaged"
-verify_installer_manifest
+for module in "$DEPLOY_STAGE"/shellpp_ii-*.bin; do
+    module_name=$(basename "$module")
+    for installer_lua_dir in "$INSTALLER_LUA_DIR" "$INSTALLER_PACKAGED_DIR"; do
+        deployed="$installer_lua_dir/$module_name"
+        cmp -s "$module" "$deployed" || {
+            echo "deployed module differs from build output: $deployed" >&2
+            exit 1
+        }
+    done
+done
 
-echo "Built $MODULE_PATH"
-echo "Synchronized editor resources: $INSTALLER_EDITOR_DIR"
-echo "Synchronized manifest resources: $INSTALLER_PACKAGED_DIR"
-shasum -a 256 "$INSTALLER_PACKAGED_DIR/main.lua" \
-    "$INSTALLER_PACKAGED_DIR/shellpp_ii.bin" \
-    "$INSTALLER_PACKAGED_DIR/shellpp_ii_icon.bin"
-echo "The manifest resource directory is ready for your private watchface packer."
+for shared_resource in main.lua shellpp_ii_icon.bin; do
+    cmp -s \
+        "$INSTALLER_LUA_DIR/$shared_resource" \
+        "$INSTALLER_PACKAGED_DIR/$shared_resource" || {
+        echo "installer shared resource changed during deployment: $shared_resource" >&2
+        exit 1
+    }
+done
+
+"$PYTHON_BIN" "$REPACK_SCRIPT" --project "$INSTALLER_DIR"
+
+if [ -n "$BUILD_TARGET" ]; then
+    echo "Deployed only $BUILD_TARGET to both installer Lua directories"
+    shasum -a 256 "$DEPLOY_STAGE"/shellpp_ii-*.bin \
+        "$INSTALLER_LUA_DIR"/shellpp_ii-*.bin \
+        "$INSTALLER_PACKAGED_DIR"/shellpp_ii-*.bin \
+        "$INSTALLER_DIR/resource.bin" "$INSTALLER_DIR/hashCode"
+else
+    echo "Deployed $profile_count firmware modules to both installer Lua directories"
+    shasum -a 256 \
+        "$INSTALLER_LUA_DIR"/shellpp_ii-*.bin \
+        "$INSTALLER_PACKAGED_DIR"/shellpp_ii-*.bin \
+        "$INSTALLER_DIR/resource.bin" "$INSTALLER_DIR/hashCode"
+fi

@@ -1,0 +1,13 @@
+--- a/native_ui.c
++++ b/native_ui.c
+@@ -440,10 +440,9 @@ static uint32_t event_cookie(uint16_t gen
+     return ((uint32_t)generation << 16) | ((uint32_t)page << 8) | slot;
+ }
+
+ static void apply_misans(void *object) {
+-    if (object)
+-        (void)LVX_STYLE_APPLY(object, STYLE_MISANS_DEMIBOLD_32, 255u, 0u);
++    (void)object;
+ }
+
+ static int memory_sample(void);

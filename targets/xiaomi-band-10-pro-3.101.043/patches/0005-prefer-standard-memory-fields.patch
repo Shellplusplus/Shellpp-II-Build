@@ -1,0 +1,12 @@
+--- a/native_fs.c
++++ b/native_fs.c
+@@ -911,8 +911,8 @@
+     /* This matches Shell++ Lua's parseNuttXMemoryInfo(): on Xiaomi's NuttX
+      * builds the Umem line carries the allocator's authoritative used value. */
+-    found_nuttx = memory_find_umem(raw, length, &nuttx_total, &nuttx_used,
+-        &nuttx_free);
++    found_nuttx = !found_total && memory_find_umem(raw, length, &nuttx_total,
++        &nuttx_used, &nuttx_free);
+     if (!found_total && found_nuttx) {
+         total = nuttx_total;
+         free_bytes = nuttx_free;

@@ -1,0 +1,275 @@
+--- a/native_app.c
++++ b/native_app.c
+@@ -19,7 +19,7 @@
+
+ #define APP_DESCRIPTOR_SIZE SHELLPP_ABI_APP_DESCRIPTOR_SIZE
+ #define PAGE_DESCRIPTOR_SIZE SHELLPP_ABI_PAGE_DESCRIPTOR_SIZE
+-#define SHELLPP_PAGE_COUNT 8u
++#define SHELLPP_PAGE_COUNT 9u
+ #define SHELLPP_APP_ID 0x00cdu
+ #define ERR_APP_MISSING (-100)
+ #define ERR_APP_CONFLICT (-101)
+@@ -38,6 +38,7 @@
+     "shellpp-display",
+     "shellpp-cpu",
+     "shellpp-restart",
++    "shellpp-apps",
+ };
+ static const char g_launcher_icon[] = "/data/shellpp-ii/shellpp_ii_icon.bin";
+ static const char g_notification_title[] = "Shell++ II";
+--- a/native_ui.c
++++ b/native_ui.c
+@@ -74,7 +74,7 @@
+ #define STYLE_MISANS_DEMIBOLD_32 ((const void *)SHELLPP_ABI_STYLE_MISANS_DEMIBOLD_32_ADDR)
+
+ #define SHELLPP_APP_ID 0x00cdu
+-#define PAGE_COUNT 8u
++#define PAGE_COUNT 9u
+ #define PAGE_HOME 0u
+ #define PAGE_FILES 1u
+ #define PAGE_VIEWER 2u
+@@ -83,6 +83,7 @@
+ #define PAGE_DISPLAY 5u
+ #define PAGE_CPU 6u
+ #define PAGE_RESTART 7u
++#define PAGE_APPS 8u
+ #define MONITOR_CPU 0u
+ #define MONITOR_MEMORY 1u
+ #define MONITOR_STATE_MEMORY_PAGE 0x01u
+@@ -198,7 +199,6 @@
+     void *descriptor;
+     void *label;
+     void *rows[UI_MAX_ROWS];
+-    struct ui_binding bindings[UI_MAX_ROWS];
+     uint16_t generation;
+     uint8_t active;
+     uint8_t interactive;
+@@ -236,6 +236,11 @@
+ };
+
+ static struct ui_page g_ui[PAGE_COUNT];
++/* Only the foreground page is interactive. Rebuild its bindings whenever a
++ * page is created or resumed instead of retaining 32 bindings per page. */
++static struct ui_binding g_bindings[UI_MAX_ROWS];
++static uint16_t g_bindings_generation;
++static uint8_t g_bindings_page;
+ static union {
+     struct shellpp_fs_page directory;
+     struct app_item_meta apps[APP_MAX_ITEMS];
+@@ -352,6 +357,7 @@
+     "显示",
+     "占用显示",
+     "重启",
++    "应用管理",
+ };
+
+ static void clear_bytes(void *address, uint32_t length) {
+@@ -694,7 +700,7 @@
+     ui->content = content;
+     ui->label = 0;
+     clear_bytes(ui->rows, sizeof(ui->rows));
+-    clear_bytes(ui->bindings, sizeof(ui->bindings));
++    if (g_bindings_page == PAGE_VIEWER) g_bindings_page = 0xffu;
+ }
+
+ static int ensure_row(struct ui_page *ui, uint32_t page_index, uint32_t slot,
+@@ -718,6 +724,9 @@
+     struct ui_page *ui = &g_ui[page_index];
+     uint32_t index;
+     if (count > UI_MAX_ROWS) count = UI_MAX_ROWS;
++    clear_bytes(g_bindings, sizeof(g_bindings));
++    g_bindings_page = (uint8_t)page_index;
++    g_bindings_generation = ui->generation;
+
+     /* Hide stale rows before painting the new directory. Do not update them
+      * with empty text: this firmware still lays out an empty list-row as a
+@@ -726,7 +735,6 @@
+         if (ui->rows[index]) {
+             set_row_hidden(ui->rows[index], 1u);
+         }
+-        clear_bytes(&ui->bindings[index], sizeof(ui->bindings[index]));
+     }
+     if (ui->label) LVX_SET_HIDDEN(ui->label, 1u);
+     if (label_text) {
+@@ -752,9 +760,9 @@
+             LVX_ALIGN_TO(ui->rows[index], ui->rows[index - 1u],
+                 ALIGN_OUT_BOTTOM_MID, 0, ROW_GAP);
+         }
+-        ui->bindings[index].action = specs[index].action;
+-        ui->bindings[index].argument = specs[index].argument;
+-        ui->bindings[index].enabled = specs[index].enabled;
++        g_bindings[index].action = specs[index].action;
++        g_bindings[index].argument = specs[index].argument;
++        g_bindings[index].enabled = specs[index].enabled;
+         set_row_enabled(ui->rows[index], specs[index].enabled);
+     }
+ }
+@@ -2427,7 +2439,7 @@
+     add_spec(specs, &count, "下一页", "查看后一页应用",
+         ACTION_APP_NEXT, 0u,
+         (g_app.page + 1u) * APP_PAGE_SIZE < g_app.total);
+-    apply_specs(PAGE_FILES, specs, count, 0, 0, 0);
++    apply_specs(PAGE_APPS, specs, count, 0, 0, 0);
+ }
+
+ static void render_file_group(void) {
+@@ -2641,10 +2653,8 @@
+         rebuild_viewer_content();
+     }
+     if (page_index == PAGE_HOME) render_home();
+-    else if (page_index == PAGE_FILES) {
+-        if (g_app_mode == APP_MODE_LIST) render_app_list();
+-        else render_file_group();
+-    }
++    else if (page_index == PAGE_FILES) render_file_group();
++    else if (page_index == PAGE_APPS) render_app_list();
+     else if (page_index == PAGE_VIEWER)
+         render_browser(page_index);
+     else if (page_index == PAGE_CACHE) render_cache();
+@@ -2825,14 +2835,16 @@
+         return 0;
+     }
+     if (action == ACTION_APPS_OPEN) {
+-        if (page_index == PAGE_FILES) app_enter_list_mode();
+-        return 1;
++        if (page_index == PAGE_FILES)
++            ACTIVITY_NAVIGATE(((uint32_t)SHELLPP_APP_ID << 16) | PAGE_APPS,
++                0u, 0u, 0u);
++        return 0;
+     }
+     if (page_index == PAGE_VIEWER &&
+             g_browser_owner != page_index) return 1;
+     if (action != ACTION_DELETE) g_delete_armed = 0u;
+     if (action != ACTION_CACHE_CLEAR) g_cache_clear_armed = 0u;
+-    if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST &&
++    if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST &&
+             action != ACTION_APP_REBOOT)
+         g_app.reboot_armed = 0u;
+     if (page_index == PAGE_RESTART && action != ACTION_RESTART_HARD &&
+@@ -2842,47 +2854,47 @@
+     }
+     switch (action) {
+         case ACTION_APP_REFRESH:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 (void)app_reload_direct();
+             break;
+         case ACTION_APP_SELECT_ALL:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_toggle_all_selection();
+             break;
+         case ACTION_APP_TOGGLE:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_toggle_selection(argument);
+             break;
+         case ACTION_APP_HIDE:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_apply_direct(APP_OPERATION_HIDE, 0u);
+             break;
+         case ACTION_APP_SHOW:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_apply_direct(APP_OPERATION_SHOW, 0u);
+             break;
+         case ACTION_APP_DELETE:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_delete_selection();
+             break;
+         case ACTION_APP_HIDE_ALL:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_apply_direct(APP_OPERATION_HIDE, 1u);
+             break;
+         case ACTION_APP_SHOW_ALL:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_apply_direct(APP_OPERATION_SHOW, 1u);
+             break;
+         case ACTION_APP_PREVIOUS:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_previous_page();
+             break;
+         case ACTION_APP_NEXT:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_next_page();
+             break;
+         case ACTION_APP_REBOOT:
+-            if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++            if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+                 app_request_reboot();
+             break;
+         case ACTION_RESTART_HARD:
+@@ -3002,10 +3014,6 @@
+ }
+
+ static int handle_back(uint32_t page_index) {
+-    if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST) {
+-        app_leave_list_mode();
+-        return 1;
+-    }
+     if (page_index == PAGE_VIEWER) {
+         if (g_browser_owner != page_index || g_browser_mode == BROWSER_LIST) {
+             g_ui[page_index].interactive = 0u;
+@@ -3047,7 +3055,9 @@
+     if (page_index >= PAGE_COUNT || slot >= UI_MAX_ROWS) return;
+     if (!g_ui[page_index].active || !g_ui[page_index].interactive ||
+             g_ui[page_index].generation != generation) return;
+-    binding = g_ui[page_index].bindings[slot];
++    if (g_bindings_page != page_index ||
++            g_bindings_generation != generation) return;
++    binding = g_bindings[slot];
+     if (!binding.enabled || binding.action == ACTION_NONE) return;
+     g_busy = 1u;
+     should_render = perform_action(page_index, binding.action,
+@@ -3090,6 +3100,9 @@
+     g_app_mode = APP_MODE_MENU;
+     restore_cut();
+     clear_bytes(g_ui, sizeof(g_ui));
++    clear_bytes(g_bindings, sizeof(g_bindings));
++    g_bindings_generation = 0u;
++    g_bindings_page = 0xffu;
+     clear_bytes(&g_directory_page, sizeof(g_directory_page));
+     clear_bytes(&g_after_cursor, sizeof(g_after_cursor));
+     clear_bytes(&g_navigation_cursor, sizeof(g_navigation_cursor));
+@@ -3161,6 +3174,8 @@
+     else if (page_index == PAGE_CPU &&
+             (g_monitor_state & MONITOR_STATE_MEMORY_PAGE))
+         (void)memory_sample();
++    else if (page_index == PAGE_APPS)
++        app_enter_list_mode();
+     render_page(page_index);
+     return 0;
+ }
+@@ -3170,6 +3185,8 @@
+             !g_ui[page_index].active ||
+             g_ui[page_index].descriptor != descriptor) return -1;
+     g_ui[page_index].interactive = 1u;
++    if (page_index == PAGE_APPS && g_app_mode != APP_MODE_LIST)
++        app_enter_list_mode();
+     if (page_index == PAGE_CACHE) {
+         g_cache_last_freed = 0u;
+         refresh_cache_report();
+@@ -3184,14 +3201,16 @@
+ int shellpp_ui_page_pause(uint32_t page_index) {
+     if (page_index >= PAGE_COUNT || !g_ui[page_index].active) return -1;
+     g_ui[page_index].interactive = 0u;
++    if (g_bindings_page == page_index) g_bindings_page = 0xffu;
+     return 0;
+ }
+
+ int shellpp_ui_page_destroy(uint32_t page_index) {
+     uint16_t generation;
+     if (page_index >= PAGE_COUNT) return -1;
+-    if (page_index == PAGE_FILES && g_app_mode == APP_MODE_LIST)
++    if (page_index == PAGE_APPS && g_app_mode == APP_MODE_LIST)
+         app_leave_list_mode();
++    if (g_bindings_page == page_index) g_bindings_page = 0xffu;
+     if (g_browser_owner == page_index) restore_cut();
+     generation = g_ui[page_index].generation;
+     clear_bytes(&g_ui[page_index], sizeof(g_ui[page_index]));

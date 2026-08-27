@@ -1,0 +1,133 @@
+--- a/native_fs.c
++++ b/native_fs.c
+@@ -46,6 +46,7 @@
+     struct {
+         void *directory;
+         uint32_t path_length;
++        int result;
+     } walk[WALK_DEPTH_LIMIT + 1u];
+ } g_fs_scratch;
+ #define g_candidates (g_fs_scratch.candidates)
+@@ -1134,25 +1135,48 @@
+ }
+
+ static int remove_tree_walk(uint32_t path_length, uint32_t depth) {
+-    void *directory;
+     uint8_t *raw;
+-    int result = SHELLPP_FS_OK;
++    uint32_t root_depth = depth;
+     if (depth > WALK_DEPTH_LIMIT) return SHELLPP_FS_ERR_PATH;
+-    directory = VELA_OPENDIR(g_work_path);
+-    if (!directory) return SHELLPP_FS_ERR_DIRECTORY;
+-    while ((raw = VELA_READDIR(directory)) != 0) {
++    g_walk_frames[depth].directory = VELA_OPENDIR(g_work_path);
++    g_walk_frames[depth].path_length = path_length;
++    g_walk_frames[depth].result = SHELLPP_FS_OK;
++    if (!g_walk_frames[depth].directory)
++        return SHELLPP_FS_ERR_DIRECTORY;
++    for (;;) {
++        raw = VELA_READDIR(g_walk_frames[depth].directory);
++        if (!raw) {
++            uint32_t finished_length = g_walk_frames[depth].path_length;
++            int finished_result = g_walk_frames[depth].result;
++            if (VELA_CLOSEDIR(g_walk_frames[depth].directory) < 0 &&
++                    finished_result == SHELLPP_FS_OK)
++                finished_result = SHELLPP_FS_ERR_CLOSE;
++            if (depth == root_depth) return finished_result;
++            g_work_path[finished_length] = '\0';
++            if (finished_result == SHELLPP_FS_OK &&
++                    VELA_RMDIR(g_work_path) < 0)
++                finished_result = SHELLPP_FS_ERR_DELETE;
++            --depth;
++            if (finished_result != SHELLPP_FS_OK &&
++                    g_walk_frames[depth].result == SHELLPP_FS_OK)
++                g_walk_frames[depth].result = finished_result;
++            g_work_path[g_walk_frames[depth].path_length] = '\0';
++            continue;
++        }
++        path_length = g_walk_frames[depth].path_length;
++        {
+         const char *name = (const char *)(raw + 1u);
+         uint32_t name_length = text_length(name, SHELLPP_FS_NAME_CAP);
+         uint32_t separator = path_length > 1u ? 1u : 0u;
+         uint32_t child_length;
+-        int child_result;
+         if (name_length == 0u || name_length >= SHELLPP_FS_NAME_CAP ||
+                 (name_length == 1u && name[0] == '.') ||
+                 (name_length == 2u && name[0] == '.' && name[1] == '.'))
+             continue;
+         child_length = path_length + separator + name_length;
+         if (child_length + 1u > sizeof(g_work_path)) {
+-            result = SHELLPP_FS_ERR_PATH;
++            if (g_walk_frames[depth].result == SHELLPP_FS_OK)
++                g_walk_frames[depth].result = SHELLPP_FS_ERR_PATH;
+             continue;
+         }
+         if (separator) g_work_path[path_length] = '/';
+@@ -1160,22 +1184,37 @@
+             g_work_path[path_length + separator + index] = name[index];
+         g_work_path[child_length] = '\0';
+         if (raw[0] == VELA_DT_DIR) {
+-            child_result = remove_tree_walk(child_length, depth + 1u);
+-            if (child_result != SHELLPP_FS_OK) result = child_result;
+-            g_work_path[child_length] = '\0';
+-            if (child_result == SHELLPP_FS_OK && VELA_RMDIR(g_work_path) < 0)
+-                result = SHELLPP_FS_ERR_DELETE;
++            void *child;
++            if (depth >= WALK_DEPTH_LIMIT) {
++                if (g_walk_frames[depth].result == SHELLPP_FS_OK)
++                    g_walk_frames[depth].result = SHELLPP_FS_ERR_PATH;
++                g_work_path[path_length] = '\0';
++                continue;
++            }
++            child = VELA_OPENDIR(g_work_path);
++            if (!child) {
++                if (g_walk_frames[depth].result == SHELLPP_FS_OK)
++                    g_walk_frames[depth].result = SHELLPP_FS_ERR_DIRECTORY;
++                g_work_path[path_length] = '\0';
++                continue;
++            }
++            ++depth;
++            g_walk_frames[depth].directory = child;
++            g_walk_frames[depth].path_length = child_length;
++            g_walk_frames[depth].result = SHELLPP_FS_OK;
++            continue;
+         } else if (raw[0] == VELA_DT_REG || raw[0] == VELA_DT_LNK) {
+-            if (VELA_UNLINK(g_work_path) < 0) result = SHELLPP_FS_ERR_DELETE;
++            if (VELA_UNLINK(g_work_path) < 0 &&
++                    g_walk_frames[depth].result == SHELLPP_FS_OK)
++                g_walk_frames[depth].result = SHELLPP_FS_ERR_DELETE;
+         } else {
+             /* Device nodes and unknown types are never removed implicitly. */
+-            result = SHELLPP_FS_ERR_UNSAFE_TYPE;
++            if (g_walk_frames[depth].result == SHELLPP_FS_OK)
++                g_walk_frames[depth].result = SHELLPP_FS_ERR_UNSAFE_TYPE;
+         }
+         g_work_path[path_length] = '\0';
++        }
+     }
+-    if (VELA_CLOSEDIR(directory) < 0 && result == SHELLPP_FS_OK)
+-        result = SHELLPP_FS_ERR_CLOSE;
+-    return result;
+ }
+
+ int shellpp_fs_remove_tree(const char *path) {
+@@ -1330,7 +1369,7 @@
+         "/data/files",
+         "/data/mass",
+     };
+-    char path[SHELLPP_FS_PATH_CAP];
++    char *path = (char *)g_fs_bytes;
+     uint32_t index;
+     int result = SHELLPP_FS_OK;
+     if (!app_package_component_valid(package_name)) return SHELLPP_FS_ERR_PATH;
+@@ -1348,7 +1387,8 @@
+             if (result == SHELLPP_FS_OK) result = SHELLPP_FS_ERR_UNSAFE_TYPE;
+             continue;
+         }
+-        if (shellpp_fs_join(roots[index], package_name, path, sizeof(path)) !=
++        if (shellpp_fs_join(roots[index], package_name, path,
++                sizeof(g_fs_scratch.bytes)) !=
+                 SHELLPP_FS_OK) return SHELLPP_FS_ERR_PATH;
+         current = shellpp_fs_remove_tree(path);
+         if (current != SHELLPP_FS_OK && result == SHELLPP_FS_OK) result = current;

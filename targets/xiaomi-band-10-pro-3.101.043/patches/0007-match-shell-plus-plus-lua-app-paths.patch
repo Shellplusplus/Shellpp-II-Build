@@ -1,0 +1,69 @@
+diff --git a/native_fs.c b/native_fs.c
+--- a/native_fs.c
++++ b/native_fs.c
+@@ -1326,7 +1326,8 @@ static int measure_directory_walk(uint32_t path_length, uint32_t depth,
+
+ int shellpp_fs_app_size(const char *package_name, uint32_t *size) {
+     static const char *const roots[] = {
+-        "/data/app", "/data/quickapp/system", "/data/quickapp/files"
++        "/data/app", "/data/quickapp/system", "/data/cache",
++        "/data/files", "/data/mass"
+     };
+     char *path = (char *)g_fs_bytes;
+     uint32_t index;
+diff --git a/native_ui.c b/native_ui.c
+--- a/native_ui.c
++++ b/native_ui.c
+@@ -1483,14 +1483,25 @@ static int app_load_registry_items(const char *path, uint8_t source_index,
+     char *key = g_app_parse_key;
+     uint8_t first = 1u;
+     uint8_t found_items = 0u;
+-    uint8_t exists;
++    uint8_t byte;
++    uint8_t previous_truncated = g_app_truncated;
++    uint16_t previous_total = g_app.total;
++    uint32_t previous_workspace_used = g_app.workspace_used;
+     int result;
+-    result = app_registry_file_state(path, &exists);
+-    if (result != SHELLPP_FS_OK) return result;
+-    if (!exists) return optional ? SHELLPP_FS_OK : SHELLPP_FS_ERR_OPEN;
++    (void)optional;
++
++    /* The Shell++ Lua reference reads the flat 10 Pro registry directly.
++     * A missing or empty registry is normalized to an empty InstalledApps
++     * list, so listing must not depend on directory enumeration. */
+     result = app_json_open(&json, path);
+-    if (result != SHELLPP_FS_OK) return result;
+-    if (app_json_expect(&json, '{') < 0) result = SHELLPP_FS_ERR_ARGUMENT;
++    if (result != SHELLPP_FS_OK) return SHELLPP_FS_OK;
++    result = app_json_peek_nonspace(&json, &byte);
++    if (result <= 0) {
++        app_json_close(&json);
++        return SHELLPP_FS_OK;
++    }
++    if (byte != '{' || app_json_expect(&json, '{') < 0)
++        result = SHELLPP_FS_ERR_ARGUMENT;
+     else {
+         result = SHELLPP_FS_OK;
+         for (;;) {
+@@ -1515,8 +1526,19 @@ static int app_load_registry_items(const char *path, uint8_t source_index,
+         }
+     }
+     app_json_close(&json);
+-    if (result != SHELLPP_FS_OK || !found_items)
+-        return result != SHELLPP_FS_OK ? result : SHELLPP_FS_ERR_ARGUMENT;
++    if (result != SHELLPP_FS_OK) {
++        /* jsonDecode() returns nil for malformed input and loadAppsJson()
++         * normalizes that value. Roll back only this registry's entries so
++         * a bad hidden registry cannot discard a valid visible registry. */
++        while (g_app.total > previous_total) {
++            --g_app.total;
++            clear_bytes(&g_app_items[g_app.total], sizeof(g_app_items[0]));
++        }
++        g_app.workspace_used = previous_workspace_used;
++        g_app_truncated = previous_truncated;
++        return SHELLPP_FS_OK;
++    }
++    (void)found_items;
+     return SHELLPP_FS_OK;
+ }
