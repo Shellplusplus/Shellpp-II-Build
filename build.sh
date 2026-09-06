@@ -197,6 +197,12 @@ build_target() {
     compile_source() {
         source_path=$1
         object_path=$2
+        set --
+        # The ELF gate treats mapping-symbol data as literal pools. Avoid
+        # inline TBB tables in 043 instead of weakening address validation.
+        if [ "$TARGET_ID" = xiaomi-band-10-pro-3.101.043 ]; then
+            set -- -fno-jump-tables
+        fi
         "$CLANG_BIN" \
             --target=arm-none-eabi \
             -mcpu="$CPU" \
@@ -215,6 +221,7 @@ build_target() {
             -Wall \
             -Wextra \
             -Werror \
+            "$@" \
             -I "$GENERATED_DIR" \
             -I "$SOURCE_DIR/include" \
             -c "$source_path" \
@@ -227,6 +234,13 @@ build_target() {
     compile_source "$TARGET_SOURCE_DIR/native_ui.c" "$OUT_DIR/native_ui.o"
     compile_source "$TARGET_SOURCE_DIR/module_prelude.S" "$OUT_DIR/module_prelude.o"
 
+    set --
+    if [ -f "$TARGET_DIR/$TARGET_ID/settings_install.c" ]; then
+        compile_source "$TARGET_DIR/$TARGET_ID/settings_rows.c" "$OUT_DIR/settings_rows.o"
+        compile_source "$TARGET_DIR/$TARGET_ID/settings_install.c" "$OUT_DIR/settings_install.o"
+        set -- "$OUT_DIR/settings_rows.o" "$OUT_DIR/settings_install.o"
+    fi
+
     run_lld \
         -flavor gnu \
         -m armelf \
@@ -238,7 +252,7 @@ build_target() {
         "$OUT_DIR/supervisor.o" \
         "$OUT_DIR/native_app.o" \
         "$OUT_DIR/native_fs.o" \
-        "$OUT_DIR/native_ui.o"
+        "$OUT_DIR/native_ui.o" "$@"
 
     "$PYTHON_BIN" "$SCRIPT_DIR/verify_shellpp_elf.py" \
         --abi-header "$ABI_HEADER" \

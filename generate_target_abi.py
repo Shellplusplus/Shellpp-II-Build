@@ -91,6 +91,24 @@ ABI_KEYS = (
 )
 
 
+SETTINGS_KEYS = (
+    "ABI_SETTINGS_TYPE_ADDR", "ABI_SETTINGS_CREATE_ADDR",
+    "ABI_SETTINGS_BIND_ADDR", "ABI_SETTINGS_COUNT_ADDR",
+    "ABI_SETTINGS_ROW_CREATE_ADDR", "ABI_SETTINGS_ROW_CONFIGURE_ADDR",
+    "ABI_SETTINGS_TEMPLATE_ADDR", "ABI_SETTINGS_LIST_SLOT_ADDR",
+    "ABI_SETTINGS_SECOND_LIST_SLOT_ADDR", "ABI_SETTINGS_REFRESH_ADDR",
+)
+SETTINGS_DATA_KEYS = frozenset((
+    "ABI_SETTINGS_TEMPLATE_ADDR", "ABI_SETTINGS_LIST_SLOT_ADDR",
+    "ABI_SETTINGS_SECOND_LIST_SLOT_ADDR",
+))
+
+def target_abi_keys(values):
+    if values.get("TARGET_ID") in ("xiaomi-band-10-pro-3.101.036", "xiaomi-band-10-pro-3.101.043"):
+        return ABI_KEYS + SETTINGS_KEYS
+    return ABI_KEYS
+
+
 class ProfileError(ValueError):
     pass
 
@@ -130,7 +148,11 @@ def unsigned(value: str, key: str) -> int:
 
 
 def validate(values: dict[str, str]) -> dict[str, int]:
-    allowed = set(METADATA_KEYS + ABI_KEYS)
+    keys = target_abi_keys(values)
+    missing = [key for key in keys if key not in values]
+    if missing:
+        raise ProfileError("missing keys: " + ", ".join(missing))
+    allowed = set(METADATA_KEYS + keys)
     unknown = sorted(set(values) - allowed)
     if unknown:
         raise ProfileError("unknown keys: " + ", ".join(unknown))
@@ -153,8 +175,11 @@ def validate(values: dict[str, str]) -> dict[str, int]:
     unsigned(values["MAX_LOADED_SIZE"], "MAX_LOADED_SIZE")
     unsigned(values["MAX_BSS_SIZE"], "MAX_BSS_SIZE")
 
-    numbers = {key: unsigned(values[key], key) for key in ABI_KEYS}
-    function_keys = [key for key in ABI_KEYS if key.endswith("_ADDR") and "STYLE_" not in key]
+    numbers = {key: unsigned(values[key], key) for key in keys}
+    for key in SETTINGS_DATA_KEYS.intersection(numbers):
+        if not numbers[key] or numbers[key] & 3:
+            raise ProfileError(f"{key} must be nonzero and word-aligned")
+    function_keys = [key for key in keys if key.endswith("_ADDR") and "STYLE_" not in key and key not in SETTINGS_DATA_KEYS]
     for key in function_keys:
         if numbers[key] == 0 or numbers[key] & 1 == 0:
             raise ProfileError(f"{key} must be a nonzero Thumb address")
@@ -177,7 +202,7 @@ def render(values: dict[str, str], numbers: dict[str, int], profile: Path) -> st
         f'#define SHELLPP_TARGET_FIRMWARE_VERSION "{values["FIRMWARE_VERSION"]}"',
         f"#define SHELLPP_ABI_FIRMWARE_CODE {int(values['FIRMWARE_CODE'], 0)}u",
     ]
-    for key in ABI_KEYS:
+    for key in target_abi_keys(values):
         macro = "SHELLPP_" + key
         lines.append(f"#define {macro} 0x{numbers[key]:08x}u")
     lines.extend(("", "#endif", ""))

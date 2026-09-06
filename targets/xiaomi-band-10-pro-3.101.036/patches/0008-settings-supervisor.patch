@@ -1,0 +1,43 @@
+--- a/supervisor.c
++++ b/supervisor.c
+@@ -1,6 +1,11 @@
+ #include "shellpp_ii_module.h"
+ #include "shellpp_native_app.h"
+ #include "shellpp_firmware_abi.h"
++
++int shellpp_settings_start(void);
++unsigned int shellpp_settings_resident(void);
++unsigned int shellpp_settings_installed(void);
++#define SHELLPP_SETTINGS_BUILD 0x03650901u
+ 
+ /* The firmware module loader does not provide compiler unwind personalities.
+  * This Supervisor does not unwind, but Clang emits the index reference. */
+@@ -55,6 +60,9 @@
+     *(int *)(g_status + 68) = native_status.install_result;
+     *(int *)(g_status + 72) = native_status.launcher_result;
+     *(int *)(g_status + 76) = native_status.notification_result;
++    *(unsigned int *)(g_status + 80) = SHELLPP_SETTINGS_BUILD;
++    *(unsigned int *)(g_status + 84) = shellpp_settings_installed();
++    *(unsigned int *)(g_status + 88) = shellpp_settings_resident();
+     for (i = 0; i < sizeof(g_status); ++i) ((unsigned char *)buffer)[i] = g_status[i];
+     return sizeof(g_status);
+ }
+@@ -64,7 +72,9 @@
+     (void)file;
+     if (!buffer || count < 16 || command[0] != SHELLPP_MAGIC) return -22;
+     g_command = command[1]; g_stage = command[2]; g_error = 0;
+-    if (g_command == SHELLPP_CMD_NOTIFY_LOADED) {
++    if (g_command == 0x5351000bu && g_stage == SHELLPP_SETTINGS_BUILD) {
++        rc = shellpp_settings_start();
++    } else if (g_command == SHELLPP_CMD_NOTIFY_LOADED) {
+         rc = shellpp_native_notify_loaded(g_stage);
+     } else if (g_command == SHELLPP_CMD_RESTORE ||
+         (g_command == SHELLPP_CMD_INSTALL && g_stage == 0)) {
+@@ -95,6 +105,7 @@
+ static int shellpp_supervisor_uninit(void *arg) {
+     (void)arg;
+     if (!shellpp_native_can_unload()) return -16;
++    if (shellpp_settings_resident()) return -16;
+     if (g_registered) { (void)UNREGISTER_DRIVER(SHELLPP_DEVICE); g_registered = 0; }
+     return 0;
+ }
