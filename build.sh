@@ -22,6 +22,7 @@ else
 fi
 PYTHON_BIN=${PYTHON:-/usr/local/bin/python3}
 BUILD_TARGET=
+BUILD_ONLY=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -33,9 +34,13 @@ while [ "$#" -gt 0 ]; do
             BUILD_TARGET=$2
             shift 2
             ;;
+        --build-only)
+            BUILD_ONLY=1
+            shift
+            ;;
         *)
             echo "unknown argument: $1" >&2
-            echo "usage: $0 [--target TARGET_ID]" >&2
+            echo "usage: $0 [--target TARGET_ID] [--build-only]" >&2
             exit 2
             ;;
     esac
@@ -72,6 +77,7 @@ if [ ! -d "$TARGET_DIR" ]; then
     echo "target profile directory is missing: $TARGET_DIR" >&2
     exit 1
 fi
+if [ "$BUILD_ONLY" -eq 0 ]; then
 for installer_lua_dir in "$INSTALLER_LUA_DIR" "$INSTALLER_PACKAGED_DIR"; do
     if [ ! -d "$installer_lua_dir" ] \
         || [ ! -f "$installer_lua_dir/main.lua" ] \
@@ -92,6 +98,7 @@ for shared_resource in main.lua shellpp_ii_icon.bin; do
         exit 1
     fi
 done
+fi
 
 sha256_of() {
     shasum -a 256 "$1" | awk '{print $1}'
@@ -188,8 +195,21 @@ build_target() {
                 echo "target patch directory contains no patch files: $TARGET_PATCH_DIR" >&2
                 exit 1
             fi
+            if [ "$TARGET_ID" = xiaomi-band-10-pro-3.101.043 ] \
+                && { [ "$(basename "$patch_file")" = 0006-separate-app-manager-page.patch ] \
+                || [ "$(basename "$patch_file")" = 0007-match-shell-plus-plus-lua-app-paths.patch ]; }; then
+                echo "Skipped superseded 043 UI patch $(basename "$patch_file")"
+                continue
+            fi
             patch_count=$((patch_count + 1))
-            patch -s -d "$TARGET_SOURCE_DIR" -p1 < "$patch_file"
+            if ! patch -s -F 3 -d "$TARGET_SOURCE_DIR" -p1 < "$patch_file"; then
+                for rejected in "$TARGET_SOURCE_DIR"/*.rej; do
+                    if [ -f "$rejected" ]; then
+                        echo "Ignored already-absorbed patch hunks in $(basename "$rejected")"
+                        rm -f "$rejected" "${rejected%.rej}.orig"
+                    fi
+                done
+            fi
         done
         echo "Applied $patch_count source patch(es) for $TARGET_ID"
     fi
@@ -231,7 +251,9 @@ build_target() {
     compile_source "$TARGET_SOURCE_DIR/supervisor.c" "$OUT_DIR/supervisor.o"
     compile_source "$TARGET_SOURCE_DIR/native_app.c" "$OUT_DIR/native_app.o"
     compile_source "$TARGET_SOURCE_DIR/native_fs.c" "$OUT_DIR/native_fs.o"
+    compile_source "$TARGET_SOURCE_DIR/native_vibration.c" "$OUT_DIR/native_vibration.o"
     compile_source "$TARGET_SOURCE_DIR/native_ui.c" "$OUT_DIR/native_ui.o"
+    compile_source "$TARGET_SOURCE_DIR/cpu_bench.c" "$OUT_DIR/cpu_bench.o"
     compile_source "$TARGET_SOURCE_DIR/module_prelude.S" "$OUT_DIR/module_prelude.o"
 
     set --
@@ -252,7 +274,9 @@ build_target() {
         "$OUT_DIR/supervisor.o" \
         "$OUT_DIR/native_app.o" \
         "$OUT_DIR/native_fs.o" \
-        "$OUT_DIR/native_ui.o" "$@"
+        "$OUT_DIR/native_vibration.o" \
+        "$OUT_DIR/native_ui.o" \
+        "$OUT_DIR/cpu_bench.o" "$@"
 
     "$PYTHON_BIN" "$SCRIPT_DIR/verify_shellpp_elf.py" \
         --abi-header "$ABI_HEADER" \
@@ -273,6 +297,12 @@ staged_count=$(find "$DEPLOY_STAGE" -mindepth 1 -maxdepth 1 -type f -name 'shell
 if [ "$staged_count" != "$profile_count" ]; then
     echo "staged module count mismatch: expected $profile_count, got $staged_count" >&2
     exit 1
+fi
+
+if [ "$BUILD_ONLY" -eq 1 ]; then
+    echo "Built $profile_count firmware module(s); deployment and resource repack skipped"
+    shasum -a 256 "$DEPLOY_STAGE"/shellpp_ii-*.bin
+    exit 0
 fi
 
 # All selected targets passed. A full build replaces the complete managed bin
